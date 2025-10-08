@@ -1,7 +1,7 @@
 import argparse
 import json
 import os
-from typing import Dict, List
+from typing import Dict
 
 import torch
 from peft.peft_model import PeftModel
@@ -9,14 +9,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from transformers.trainer_utils import get_last_checkpoint
 
 from config import Config
-from data_processor import (
-    build_dialogue_context,
-    create_prompt_for_step1,
-    create_prompt_for_step2,
-    create_prompt_for_step3,
-    create_prompt_for_step4,
-    create_prompt_for_step5,
-)
+from data_processor import create_bulletproof_prompt_and_answer
 
 
 def _prepare_quant_config(cfg: Config) -> BitsAndBytesConfig:
@@ -37,13 +30,12 @@ def _generate(model, tokenizer, prompt: str, cfg: Config) -> str:
         max_length=cfg.max_seq_length,
     ).to(model.device)
     with torch.inference_mode():
-        do_sample = cfg.generation_temperature > 0.0
+        do_sample = cfg.inference_do_sample
 
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=cfg.generation_max_new_tokens,
-            temperature=cfg.generation_temperature,
-            top_p=cfg.generation_top_p,
+            max_new_tokens=cfg.inference_max_new_tokens,
+            temperature=cfg.inference_temperature if do_sample else 1.0,
             do_sample=do_sample,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
@@ -52,7 +44,8 @@ def _generate(model, tokenizer, prompt: str, cfg: Config) -> str:
     return tokenizer.decode(generated, skip_special_tokens=True).strip()
 
 
-def _parse_model_output(output: str) -> Dict:
+def parse_model_output(output: str) -> Dict:
+    """解析模型输出为JSON格式"""
     candidate = output.strip()
     try:
         return json.loads(candidate)
@@ -66,42 +59,6 @@ def _parse_model_output(output: str) -> Dict:
             except json.JSONDecodeError:
                 pass
     return {"raw_output": candidate}
-
-
-def run_c_cos_chain(model, tokenizer, dialogue: List[Dict[str, str]], target: str, cfg: Config) -> Dict:
-    context = build_dialogue_context(dialogue)
-    meta = {
-        "conversation_id": "inference",
-        "turn_index": len(dialogue) - 1,
-        "speaker": dialogue[-1].get("speaker", "User"),
-        "utterance": dialogue[-1].get("text", ""),
-    }
-
-    chain_outputs: Dict[str, Dict] = {}
-    annotation_stub: Dict = {}
-
-    step_sequence = [
-        ("step1", create_prompt_for_step1),
-        ("step2", create_prompt_for_step2),
-        ("step3", create_prompt_for_step3),
-        ("step4", create_prompt_for_step4),
-        ("step5", create_prompt_for_step5),
-    ]
-
-    for step_name, step_fn in step_sequence:
-        instruction, _ = step_fn(context, target, annotation_stub, meta)
-        if chain_outputs:
-            instruction = (
-                f"{instruction}\n\n前序步骤摘要："
-                f"\n{json.dumps(chain_outputs, ensure_ascii=False)}"
-            )
-        output_text = _generate(model, tokenizer, instruction, cfg)
-        parsed_output = _parse_model_output(output_text)
-        chain_outputs[step_name] = parsed_output
-        if isinstance(parsed_output, dict):
-            annotation_stub.update(parsed_output)
-
-    return chain_outputs
 
 
 def _load_model_and_tokenizer(cfg: Config):
@@ -140,25 +97,75 @@ def _load_model_and_tokenizer(cfg: Config):
     return model, tokenizer
 
 
-def run_inference(prompt: str, target: str) -> None:
-    cfg = Config()
+def run_inference_v2(dialogue_text: str, target_utterance: str, cfg: Config = None) -> Dict:
+    """
+    v2版本的推理函数
+    使用防弹指令和重试机制
+    """
+    if cfg is None:
+        cfg = Config()
+    
     model, tokenizer = _load_model_and_tokenizer(cfg)
+    
+    # 创建统一的数据点结构（用于生成prompt）
+    unified_datapoint = {
+        "dialogue_text": dialogue_text,
+        "target_utterance": target_utterance,
+        "elements": {}  # 推理时不需要预填充
+    }
+    
+    # 创建防弹指令（只使用prompt部分）
+    prompt_data = create_bulletproof_prompt_and_answer(unified_datapoint)
+    prompt = prompt_data["prompt"]
+    
+    # 重试机制
+    for attempt in range(cfg.inference_max_retries):
+        try:
+            print(f"\n--- 推理尝试 {attempt + 1}/{cfg.inference_max_retries} ---")
+            output_text = _generate(model, tokenizer, prompt, cfg)
+            print(f"模型输出: {output_text[:200]}...")  # 显示前200字符
+            
+            result = parse_model_output(output_text)
+            
+            # 验证结果是否包含所有必需字段
+            required_fields = ["holder", "target", "opinion", "sentiment", "cause", "flipping", "trigger"]
+            if all(field in result for field in required_fields):
+                print("✓ 成功解析完整的JSON结果")
+                return result
+            else:
+                missing = [f for f in required_fields if f not in result]
+                print(f"✗ 缺少字段: {missing}")
+                if attempt == cfg.inference_max_retries - 1:
+                    return result  # 最后一次尝试，返回不完整的结果
+        except Exception as e:
+            print(f"✗ 推理失败: {e}")
+            if attempt == cfg.inference_max_retries - 1:
+                return {"error": str(e)}
+    
+    return {"error": "达到最大重试次数"}
 
-    sample_dialogue = [
-        {"speaker": "User", "text": prompt},
-    ]
 
-    print("运行 C-CoS 五步推理链...")
-    final_result = run_c_cos_chain(model, tokenizer, sample_dialogue, target, cfg)
-
-    print("\n--- 最终推理结果 ---")
-    print(json.dumps(final_result, indent=2, ensure_ascii=False))
+def run_inference(prompt: str, target: str = None) -> None:
+    """
+    简单的推理接口（向后兼容）
+    """
+    cfg = Config()
+    
+    # 将简单文本转换为对话格式
+    dialogue_text = f"A: {prompt}"
+    target_utterance = target if target else prompt
+    
+    print("运行 ABSA v2.0 推理...")
+    result = run_inference_v2(dialogue_text, target_utterance, cfg)
+    
+    print("\n--- 推理结果 ---")
+    print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run ABSA C-CoS inference")
-    parser.add_argument("--dialogue", type=str, help="以换行分隔的对话，格式：Speaker: Utterance", default=None)
-    parser.add_argument("--target", type=str, help="关注的目标或对象", default="overall experience")
+    parser = argparse.ArgumentParser(description="Run ABSA v2.0 inference")
+    parser.add_argument("--dialogue", type=str, help="对话文本", default=None)
+    parser.add_argument("--target", type=str, help="目标语句", default=None)
     parser.add_argument("--merge", action="store_true", help="将 LoRA 权重合并并导出成独立模型")
     parser.add_argument("--export_dir", type=str, default="./output_model/merged", help="合并模型的输出目录")
     args = parser.parse_args()
@@ -176,22 +183,20 @@ def main() -> None:
         return
 
     if args.dialogue:
-        dialogue_lines = [line.strip() for line in args.dialogue.split("\n") if line.strip()]
-        dialogue_list = []
-        for line in dialogue_lines:
-            if ":" in line:
-                speaker, text = line.split(":", 1)
-                dialogue_list.append({"speaker": speaker.strip(), "text": text.strip()})
-            else:
-                dialogue_list.append({"speaker": "User", "text": line})
-        model, tokenizer = _load_model_and_tokenizer(cfg)
-        print("运行 C-CoS 五步推理链...")
-        final_result = run_c_cos_chain(model, tokenizer, dialogue_list, args.target, cfg)
-        print("\n--- 最终推理结果 ---")
-        print(json.dumps(final_result, indent=2, ensure_ascii=False))
+        # 使用提供的对话
+        dialogue_text = args.dialogue
+        target_utterance = args.target if args.target else dialogue_text.split('\n')[-1]
+        result = run_inference_v2(dialogue_text, target_utterance, cfg)
+        print("\n--- 推理结果 ---")
+        print(json.dumps(result, indent=2, ensure_ascii=False))
     else:
-        default_prompt = "今天试运行 MiniCPM 的适配效果，感觉对话小助手很聪明。"
-        run_inference(default_prompt, args.target)
+        # 使用默认测试示例
+        print("使用默认测试示例...")
+        test_dialogue = "A: I really enjoyed the movie last night.\nB: Oh really? I thought it was quite boring."
+        test_target = "I thought it was quite boring."
+        result = run_inference_v2(test_dialogue, test_target, cfg)
+        print("\n--- 推理结果 ---")
+        print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
