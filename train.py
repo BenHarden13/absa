@@ -9,16 +9,19 @@ from transformers import (
 from trl import SFTTrainer
 
 from config import Config
-from data_processor import load_and_process_data
+from data_processor import load_and_process_data_v2
 
 
 def main() -> None:
     cfg = Config()
 
     print("加载并处理数据...")
-    train_dataset = load_and_process_data(cfg.train_file, max_samples=500)
+    train_dataset = load_and_process_data_v2(cfg.train_file)
     print(f"实际用于训练的数据条数：{len(train_dataset)}")
-    assert len(train_dataset) <= 500, f"数据截断未生效，当前样本数={len(train_dataset)}。"
+    
+    print("加载验证数据...")
+    eval_dataset = load_and_process_data_v2(cfg.valid_file)
+    print(f"验证数据条数：{len(eval_dataset)}")
 
     print("加载模型与分词器...")
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name_or_path, trust_remote_code=True)
@@ -54,6 +57,7 @@ def main() -> None:
     training_args = TrainingArguments(
         output_dir=cfg.output_dir,
         per_device_train_batch_size=cfg.per_device_train_batch_size,
+        per_device_eval_batch_size=cfg.per_device_eval_batch_size,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         num_train_epochs=cfg.num_train_epochs,
         learning_rate=cfg.learning_rate,
@@ -65,6 +69,9 @@ def main() -> None:
         save_strategy="steps",         # 按步保存
         save_safetensors=True,         # 使用 safetensors
         gradient_checkpointing=cfg.gradient_checkpointing,
+        evaluation_strategy=cfg.evaluation_strategy,  # 新增：评估策略
+        eval_steps=cfg.eval_steps,                    # 新增：评估步数
+        load_best_model_at_end=cfg.load_best_model_at_end,  # 新增：加载最佳模型
         report_to="none",
     )
 
@@ -73,6 +80,7 @@ def main() -> None:
         model=model,
         args=training_args,
         train_dataset=train_dataset,
+        eval_dataset=eval_dataset,  # 新增：添加验证数据集
         tokenizer=tokenizer,
         peft_config=lora_config,
         max_seq_length=cfg.max_seq_length,
